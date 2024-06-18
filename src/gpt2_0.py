@@ -3,7 +3,9 @@ from torch import nn
 import math
 import torch.nn.functional as F
 from dataclasses import dataclass
-
+import inspect
+import torch.utils
+from dataload import Dataloader
 
 class  CausalSelfAttention(nn.Module):
     def __init__(self,config):
@@ -185,6 +187,27 @@ class GPT(nn.Module):
 
         return model
     
+    def config_optimizer(self,weight_decay,lr,betas,device):
+        params={pn:p for pn,p in self.named_parameters()}
+        params={pn:p for pn,p in params.items() if p.requires_grad}
+        decayed_points=[p for pn,p in params.items() if p.dim()>=2]
+        non_decayed_points=[p for pn,p in params.items() if p.dim()<2]
+        optimizer_groups=[
+            {'params':decayed_points,'weight_decay':weight_decay},
+            {'params':non_decayed_points,'weight_decay':0}]
+        num_decay_params=sum(p.numel() for p in decayed_points)
+        num_nodecay_params=sum(p.numel() for p in non_decayed_points)
+        print(f'there are {len(decayed_points)} decayed_params with total num of parameters = {num_decay_params}')
+        print(f'there are {len(non_decayed_points)} non_decayed_params with total num of parameters = {num_nodecay_params}')
+        # Create AdamW optimizer and use the fused version if it is available
+        #if cuda available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+
+
+        optimizer=torch.optim.AdamW(optimizer_groups,lr=lr,betas=betas,eps=1e-8,fused=use_fused)
+        return optimizer
 
 #----------------------------------------------------------------------------------------------------------------
 import time
@@ -202,32 +225,6 @@ model=GPT(GPTConfig(vocab_size=50304))
 num_return_sequences = 5
 max_length = 30
 
-import tiktoken
-
-class Dataloader:
-    def __init__(self,B,T,filename=None):
-        self.B = B
-        self.T = T
-        if filename is None:
-            filename = 'input.txt'
-        text=open(filename,'r').read() 
-        enc=tiktoken.get_encoding('gpt2')
-        self.tokens=torch.tensor(enc.encode(text))
-        print(f'total number of tokens {len(self.tokens)}')
-        print(f'1 epoch {len(self.tokens) // (B*T)} batches')
-
-        self.current_pos=0
-    
-    def next_batch(self):
-        if self.current_pos+(self.B*self.T)+1 >= len(self.tokens):
-            self.current_pos=0
-        batch=self.tokens[self.current_pos:self.current_pos+self.B*self.T+1]
-        batch=batch.to(device)
-        x=batch[:-1].view(self.B,self.T)
-        y=batch[1:].view(self.B,self.T)
-        self.current_pos+=self.B*self.T
-        return x,y
-
 torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(42)
@@ -243,10 +240,34 @@ model.eval()
 # model.to(device)
 model=torch.compile(model)
 
-optimizer=torch.optim.AdamW(params=model.parameters(),lr=3e-4)
+max_lr=6e-4
+min_lr=max_lr*0.1
+warmup_steps=10
+max_steps=50
+'''
+This lr scheduler is implemntation of cosine scheduling
+and learning rate is given as 
+η(t) = min_lr + 0.5 * (max_lr - min_lr) * (1 + cos(t * π / T))
+
+here T is max_steps-warmup_steps
+t is it-warmup_steps
+'''
+def get_lr(it):
+    if it<warmup_steps :
+        return max_lr*(it+1)/warmup_steps
+    if it>max_steps :
+        return min_lr
+    
+    decay_ratio=(it-warmup_steps)/(max_steps-warmup_steps)
+    assert 0<decay_ratio<1
+    coeff=0.5*(1.0+math.cos(math.pi*decay_ratio))
+    return min_lr+coeff*(max_lr-min_lr)
+
+# optimizer=torch.optim.AdamW(params=model.parameters(),lr=3e-4,betas=(0.9,0.995),eps=1e-8)
+optimizer=model.config_optimizer(weight_decay=0.01,lr=max_lr,betas=(0.9,0.995),device=device)
 t0=time.time()
 from tqdm import tqdm
-for i in tqdm(range(3)):
+for step in tqdm(range(max_steps)):
     start_time=time.time()
     x,y=train_loader.next_batch()
     # if gpu is used
@@ -256,11 +277,17 @@ for i in tqdm(range(3)):
     logits,loss=model(x,y)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
+    norm=torch.nn.utils.clip_grad_norm(model.parameters(),1.0)
+    #lr scheduler
+    lr=get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr']=lr
+
     optimizer.step()
     end_time = time.time()
     time_taken = end_time - start_time
     tokens_per_sec=(train_loader.B*train_loader.T)/(time_taken)
-    tqdm.write(f' loss {loss:.2f} time taken {time_taken:.2f} sec tokens per sec {tokens_per_sec}')
+    tqdm.write(f' loss {loss:.2f} time taken {time_taken:.2f} norm {norm:.2f} sec tokens per sec {tokens_per_sec}')
 
 
 print('total time taken ',time.time() - t0)
