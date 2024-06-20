@@ -201,6 +201,8 @@ class GPT(nn.Module):
         print(f'there are {len(non_decayed_points)} non_decayed_params with total num of parameters = {num_nodecay_params}')
         # Create AdamW optimizer and use the fused version if it is available
         #if cuda available
+        import sys;
+        sys.exit(0)
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
@@ -220,7 +222,7 @@ device='cpu'
 #     device='mps'
 print(f'using {device}')
 
-model=GPT(GPTConfig(vocab_size=50304))
+
 
 num_return_sequences = 5
 max_length = 30
@@ -228,14 +230,25 @@ max_length = 30
 torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(42)
+
+total_batch_size=524288 # this total batch size represents total no of tokens in an epoch
+B=16
+T=1024
+assert total_batch_size % (B*T)==0
+grad_acc_steps=total_batch_size//(B*T)
+print(f'desired batch size is {total_batch_size}')
+print(f'gradient accumulation steps is  {grad_acc_steps}')
+
 #b=32,t=1024
-train_loader=Dataloader(B=4,T=32)
+train_loader=Dataloader(B,T)
+
+
 
 # this operation is req in case of GPU but i am using CPU so it is not necessary but if using mps
 #then set prec to medium
 # torch.set_float32_matmul_precision('high')
 
-model=GPT(GPTConfig())
+model=GPT(GPTConfig(vocab_size=50304))
 model.eval()
 # model.to(device)
 model=torch.compile(model)
@@ -266,17 +279,19 @@ def get_lr(it):
 # optimizer=torch.optim.AdamW(params=model.parameters(),lr=3e-4,betas=(0.9,0.995),eps=1e-8)
 optimizer=model.config_optimizer(weight_decay=0.01,lr=max_lr,betas=(0.9,0.995),device=device)
 t0=time.time()
+
 from tqdm import tqdm
 for step in tqdm(range(max_steps)):
     start_time=time.time()
-    x,y=train_loader.next_batch()
+    optimizer.zero_grad(set_to_none=True)
+    for micro_steps in range(grad_acc_steps):
+        x,y=train_loader.next_batch()
     # if gpu is used
     # with torch.autocast(device_type=device, dtype=torch.float16):
     #     logits,loss=model(x,y)
     #     import code;code.interact(local=locals())
-    logits,loss=model(x,y)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
+        logits,loss=model(x,y)
+        loss.backward()
     norm=torch.nn.utils.clip_grad_norm(model.parameters(),1.0)
     #lr scheduler
     lr=get_lr(step)
