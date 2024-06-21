@@ -232,7 +232,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(42)
 
 total_batch_size=524288 # this total batch size represents total no of tokens in an epoch
-B=16
+B=16  # this number is totally based on size of gpu
 T=1024
 assert total_batch_size % (B*T)==0
 grad_acc_steps=total_batch_size//(B*T)
@@ -258,7 +258,7 @@ min_lr=max_lr*0.1
 warmup_steps=10
 max_steps=50
 '''
-This lr scheduler is implemntation of cosine scheduling
+This lr scheduler is implemntation of cosine annaeling
 and learning rate is given as 
 η(t) = min_lr + 0.5 * (max_lr - min_lr) * (1 + cos(t * π / T))
 
@@ -283,6 +283,7 @@ t0=time.time()
 from tqdm import tqdm
 for step in tqdm(range(max_steps)):
     start_time=time.time()
+    loss_acc=0.0
     optimizer.zero_grad(set_to_none=True)
     for micro_steps in range(grad_acc_steps):
         x,y=train_loader.next_batch()
@@ -291,6 +292,8 @@ for step in tqdm(range(max_steps)):
     #     logits,loss=model(x,y)
     #     import code;code.interact(local=locals())
         logits,loss=model(x,y)
+        loss=loss / grad_acc_steps
+        loss_acc+=loss
         loss.backward()
     norm=torch.nn.utils.clip_grad_norm(model.parameters(),1.0)
     #lr scheduler
@@ -301,8 +304,8 @@ for step in tqdm(range(max_steps)):
     optimizer.step()
     end_time = time.time()
     time_taken = end_time - start_time
-    tokens_per_sec=(train_loader.B*train_loader.T)/(time_taken)
-    tqdm.write(f' loss {loss:.2f} time taken {time_taken:.2f} norm {norm:.2f} sec tokens per sec {tokens_per_sec}')
+    tokens_per_sec=(train_loader.B*train_loader.T*grad_acc_steps)/(time_taken)
+    tqdm.write(f' loss {loss_acc:.2f} time taken {time_taken:.2f} norm {norm:.2f} sec tokens per sec {tokens_per_sec}')
 
 
 print('total time taken ',time.time() - t0)
